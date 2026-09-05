@@ -1,0 +1,26 @@
+name: Nightly USAspending ingest (Gulf FL + MS)
+on:
+  schedule:
+    - cron: "0 6 * * *" # 06:00 UTC ≈ 2am ET
+  workflow_dispatch:
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install deps
+        run: pip install -r ingest/requirements.txt
+      - name: Run ingest
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          python ingest/usaspending_gulf_ms.py
+      - name: Upload JSONL artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: usaspending-gulf-ms
+          path: ingest/out/
