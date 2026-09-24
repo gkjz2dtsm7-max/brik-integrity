@@ -208,7 +208,7 @@ def maybe_upsert_postgres(rows: list[dict]) -> int:
                     n += 1
                 return n
     except psycopg2.Error as e:
-        print(f"Postgres upsert failed — JSONL only: {e}", file=sys.stderr)
+        print(f"Postgres upsert failed ({type(e).__name__}) — JSONL only", file=sys.stderr)
         return 0
 
 
