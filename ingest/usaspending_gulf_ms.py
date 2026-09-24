@@ -143,72 +143,73 @@ def maybe_upsert_postgres(rows: list[dict]) -> int:
     except ImportError:
         print("psycopg2 not installed — JSONL only", file=sys.stderr)
         return 0
-    conn = psycopg2.connect(url)
-    cur = conn.cursor()
-    # ensure seed places exist
-    cur.execute(
-        """
-        INSERT INTO places (fips_code, name, state, county, type) VALUES
-          ('12045', 'Gulf County', 'FL', 'Gulf', 'county'),
-          ('28', 'Mississippi', 'MS', NULL, 'state')
-        ON CONFLICT (fips_code) DO NOTHING
-        """
-    )
-    place_ids: dict[str, str] = {}
-    cur.execute("SELECT fips_code, id FROM places WHERE fips_code IN ('12045','28')")
-    for fips, pid in cur.fetchall():
-        place_ids[str(fips)] = str(pid)
+    try:
+        with psycopg2.connect(url) as conn:
+            with conn.cursor() as cur:
+                # ensure seed places exist
+                cur.execute(
+                    """
+                    INSERT INTO places (fips_code, name, state, county, type) VALUES
+                      ('12045', 'Gulf County', 'FL', 'Gulf', 'county'),
+                      ('28', 'Mississippi', 'MS', NULL, 'state')
+                    ON CONFLICT (fips_code) DO NOTHING
+                    """
+                )
+                place_ids: dict[str, str] = {}
+                cur.execute("SELECT fips_code, id FROM places WHERE fips_code IN ('12045','28')")
+                for fips, pid in cur.fetchall():
+                    place_ids[str(fips)] = str(pid)
 
-    n = 0
-    for r in rows:
-        source_id = str(r.get("Award ID") or r.get("generated_internal_id") or "")
-        if not source_id:
-            continue
-        job = str(r.get("_ingest_job") or "")
-        state, county, fips = infer_geo(job)
-        place_id = place_ids.get(fips or "")
-        amount = r.get("Award Amount")
-        if amount is None and job.endswith("-loans"):
-            amount = r.get("Face Value of Loan")
-        cur.execute(
-            """
-            INSERT INTO awards (
-              usaspending_id, award_type, title, description, agency_name,
-              amount, start_date, end_date, recipient_name, place_id,
-              fips_code, state, county, url, last_updated
-            ) VALUES (
-              %s, %s, %s, %s, %s,
-              %s, %s, %s, %s, %s,
-              %s, %s, %s, %s, now()
-            )
-            ON CONFLICT (usaspending_id) DO UPDATE SET
-              amount = EXCLUDED.amount,
-              description = EXCLUDED.description,
-              agency_name = EXCLUDED.agency_name,
-              last_updated = now()
-            """,
-            (
-                source_id,
-                infer_award_type(job, r),
-                (r.get("Description") or "")[:500] or None,
-                r.get("Description"),
-                r.get("Awarding Agency"),
-                amount,
-                r.get("Start Date") or None,
-                r.get("End Date") or None,
-                r.get("Recipient Name"),
-                place_id,
-                fips,
-                state or r.get("Place of Performance State Code"),
-                county,
-                f"https://www.usaspending.gov/award/{source_id}" if source_id else None,
-            ),
-        )
-        n += 1
-    conn.commit()
-    cur.close()
-    conn.close()
-    return n
+                n = 0
+                for r in rows:
+                    source_id = str(r.get("Award ID") or r.get("generated_internal_id") or "")
+                    if not source_id:
+                        continue
+                    job = str(r.get("_ingest_job") or "")
+                    state, county, fips = infer_geo(job)
+                    place_id = place_ids.get(fips or "")
+                    amount = r.get("Award Amount")
+                    if amount is None and job.endswith("-loans"):
+                        amount = r.get("Face Value of Loan")
+                    cur.execute(
+                        """
+                        INSERT INTO awards (
+                          usaspending_id, award_type, title, description, agency_name,
+                          amount, start_date, end_date, recipient_name, place_id,
+                          fips_code, state, county, url, last_updated
+                        ) VALUES (
+                          %s, %s, %s, %s, %s,
+                          %s, %s, %s, %s, %s,
+                          %s, %s, %s, %s, now()
+                        )
+                        ON CONFLICT (usaspending_id) DO UPDATE SET
+                          amount = EXCLUDED.amount,
+                          description = EXCLUDED.description,
+                          agency_name = EXCLUDED.agency_name,
+                          last_updated = now()
+                        """,
+                        (
+                            source_id,
+                            infer_award_type(job, r),
+                            (r.get("Description") or "")[:500] or None,
+                            r.get("Description"),
+                            r.get("Awarding Agency"),
+                            amount,
+                            r.get("Start Date") or None,
+                            r.get("End Date") or None,
+                            r.get("Recipient Name"),
+                            place_id,
+                            fips,
+                            state or r.get("Place of Performance State Code"),
+                            county,
+                            f"https://www.usaspending.gov/award/{source_id}" if source_id else None,
+                        ),
+                    )
+                    n += 1
+                return n
+    except Exception as e:
+        print(f"Postgres upsert failed — JSONL only: {e}", file=sys.stderr)
+        return 0
 
 
 def main() -> int:
