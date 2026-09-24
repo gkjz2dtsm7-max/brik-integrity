@@ -210,6 +210,7 @@ def maybe_upsert_postgres(rows: list[dict]) -> int:
                 return n
     except psycopg2.Error as e:
         detail = re.sub(r"(postgres(?:ql)?://[^:\\s]+:)[^@\\s]+@", r"\\1***@", str(e)).strip()
+        detail = re.sub(r"(?i)\\b(password|passwd|pwd)\\s*=\\s*[^\\s]+", r"\\1=***", detail)
         detail = detail.splitlines()[0][:300] if detail else "no detail"
         print(f"Postgres upsert failed ({type(e).__name__}): {detail} — JSONL only", file=sys.stderr)
         return 0
