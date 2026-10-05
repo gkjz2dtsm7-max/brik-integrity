@@ -1,0 +1,63 @@
+{
+  "pulledAt": "2026-10-04",
+  "limits": "This file is the full empty-search response from the Mississippi contract grid (572 rows) and the bid and public notice grid (141 rows), plus the detail record for every contract. It is not every purchase order in MAGIC. Agency bid cities were blank on all 141 bid rows, so bids are not pinned to a county.",
+  "sourceClock": "Dates are the calendar day in Central Time from the public /Date stamps. The inside or after window uses the pull date 2026-10-04.",
+  "flagNote": "P-Card, manufactured in Mississippi, energy efficiency, and green tech use the public codes 01 for Yes and 02 for No. The contract grid script prints that for P-Card. The detail page printed No for 02 on manufactured, energy, and green. Blank and 00 stay blank. Payment code Z000 is printed on the detail page as Pay immediately due net. Other payment codes stay as codes.",
+  "counts": {
+    "contracts": 572,
+    "vendors": 499,
+    "msPlaced": 118,
+    "msUnplaced": 0,
+    "outOfState": 454,
+    "bids": 141,
+    "attachments": 4252,
+    "lineItems": 4938,
+    "insideDates": 572,
+    "pageListings": 129,
+    "pageListingsNotInGrid": 11,
+    "preapprovedGroups": 9
+  },
+  "sources": [
+    {
+      "title": "Contract search",
+      "url": "https://www.ms.gov/dfa/contract_bid_search/Contract?autoloadGrid=true"
+    },
+    {
+      "title": "Bid and public notice search",
+      "url": "https://www.ms.gov/dfa/contract_bid_search/bid?autoloadGrid=true"
+    },
+    {
+      "title": "Contract search questions",
+      "url": "https://www.ms.gov/dfa/contract_bid_search/Home/FAQs"
+    },
+    {
+      "title": "Competitive contracts",
+      "url": "https://www.dfa.ms.gov/competitive-contracts"
+    },
+    {
+      "title": "Statewide contracts",
+      "url": "https://www.dfa.ms.gov/statewide-agency-contracts"
+    },
+    {
+      "title": "Cooperative contracts",
+      "url": "https://www.dfa.ms.gov/cooperative-contracts"
+    },
+    {
+      "title": "Preapproved vendor lists",
+      "url": "https://www.dfa.ms.gov/preapproved-vendor-information"
+    },
+    {
+      "title": "Mississippi suppliers",
+      "url": "https://www.dfa.ms.gov/mississippi-suppliersvendors"
+    },
+    {
+      "title": "Vendor registration",
+      "url": "https://www.dfa.ms.gov/vendors"
+    },
+    {
+      "title": "Competitive contracts page",
+      "url": "https://www.dfa.ms.gov/competitive-contracts_DEF",
+      "note": "The shorter /competitive-contracts path returned 404 on the pull. This is the page that answered."
+    }
+  ]
+}
