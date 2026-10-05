@@ -143,7 +143,16 @@ def maybe_upsert_postgres(rows: list[dict]) -> int:
     except ImportError:
         print("psycopg2 not installed — JSONL only", file=sys.stderr)
         return 0
-    conn = psycopg2.connect(url)
+
+    try:
+        return _upsert_postgres(rows, url, psycopg2.connect)
+    except psycopg2.Error as e:
+        print(f"Postgres upsert failed — JSONL only: {e}", file=sys.stderr)
+        return 0
+
+
+def _upsert_postgres(rows: list[dict], url: str, connect) -> int:
+    conn = connect(url)
     cur = conn.cursor()
     # ensure seed places exist
     cur.execute(
