@@ -4,6 +4,11 @@ Writes JSONL under ingest/out/ and optional Postgres upsert when DATABASE_URL is
 One award-type group per API call (USAspending rule).
 Never invents fields — Missing stays Missing.
 
+spending_by_award is a top-N index. Award IDs from each successful job are stored in
+ingest/out/prior_award_ids.json. IDs that disappear from a later search are read from
+the award detail endpoint and kept on the same JSONL/upsert path with
+_source=detail_fallback. JSONL stays off GitHub Pages.
+
 GitHub-hosted runners are IPv4-only. db.<ref>.supabase.co is AAAA-only, so the
 upsert tries the us-east-1 session pooler (IPv4) before the original URL.
 """
@@ -14,6 +19,7 @@ import os
 import re
 import sys
 import urllib.request
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote, unquote, urlsplit, urlunsplit
@@ -26,6 +32,15 @@ except ImportError:
 
 OUT = Path(__file__).resolve().parent / "out"
 API = "https://api.usaspending.gov/api/v2/search/spending_by_award/"
+DETAIL_API = "https://api.usaspending.gov/api/v2/awards/"
+PRIOR_IDS_PATH = OUT / "prior_award_ids.json"
+SOURCE_SEARCH = "spending_by_award"
+SOURCE_DETAIL = "detail_fallback"
+# HHS assistance generated id, verified: ASST_NON_RHTCMS332063_075 returns the award
+# while GET /awards/RHTCMS332063/ is 404 and spending_by_award award_ids returns 0.
+HHS_ASSISTANCE_AGENCY = "075"
+_GENERATED_AWARD_ID = re.compile(r"^(?:ASST_NON|ASST_AGG|CONT_AWD|CONT_IDV)_")
+DetailFetcher = Callable[[str], tuple[dict | None, str]]
 
 GROUPS = {
     "contracts": ["A", "B", "C", "D"],
@@ -82,7 +97,15 @@ def sort_field_for(name: str) -> str:
     return "Award ID" if name.endswith("-loans") else "Award Amount"
 
 
-def fetch_all(name: str, filters: dict, page_limit: int = 20) -> list[dict]:
+def annotate_search_row(row: dict, job: str, ingested_at: str) -> dict:
+    row["_ingest_job"] = job
+    row["_ingested_at"] = ingested_at
+    row["_source"] = SOURCE_SEARCH
+    return row
+
+
+def fetch_all(name: str, filters: dict, page_limit: int = 20) -> tuple[list[dict], bool]:
+    """Return (rows, ok). ok is False when a page request fails so a partial top-N is not treated as complete."""
     rows: list[dict] = []
     page = 1
     while page <= page_limit:
@@ -106,19 +129,19 @@ def fetch_all(name: str, filters: dict, page_limit: int = 20) -> list[dict]:
                 except Exception:
                     detail = str(e)
             print(f"ERROR {name} page {page}: {e} {detail}", file=sys.stderr)
-            break
+            return rows, False
         batch = result.get("results") or []
         if not batch:
-            break
+            return rows, True
+        ingested_at = datetime.now(timezone.utc).isoformat()
         for r in batch:
-            r["_ingest_job"] = name
-            r["_ingested_at"] = datetime.now(timezone.utc).isoformat()
+            annotate_search_row(r, name, ingested_at)
             rows.append(r)
         print(f"{name} page {page}: +{len(batch)} (total {len(rows)})")
         if not result.get("page_metadata", {}).get("hasNext"):
-            break
+            return rows, True
         page += 1
-    return rows
+    return rows, True
 
 
 def infer_award_type(job: str, row: dict) -> str | None:
@@ -142,6 +165,213 @@ def infer_geo(job: str) -> tuple[str | None, str | None, str | None]:
     if job.startswith("mississippi"):
         return "MS", None, "28"
     return None, None, None
+
+
+def award_id_of(row: dict) -> str:
+    value = row.get("Award ID")
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def missing_award_ids(prior: set[str], today_rows: list[dict]) -> list[str]:
+    """Award IDs tracked for this job that spending_by_award did not return today."""
+    today = {award_id_of(row) for row in today_rows}
+    today.discard("")
+    return sorted((prior or set()) - today)
+
+
+def detail_candidate_ids(award_id: str, job: str) -> list[str]:
+    """Detail path ids. Grants without a generated id use ASST_NON_<FAIN>_075."""
+    cleaned = award_id.strip()
+    if not cleaned:
+        return []
+    if _GENERATED_AWARD_ID.match(cleaned):
+        return [cleaned]
+    if job.endswith("-grants"):
+        return [f"ASST_NON_{cleaned}_{HHS_ASSISTANCE_AGENCY}"]
+    return []
+
+
+def _as_dict(value: object) -> dict:
+    return value if isinstance(value, dict) else {}
+
+
+def map_detail_to_row(
+    detail: dict,
+    job: str,
+    award_id: str,
+    ingested_at: str,
+    fetched_id: str | None = None,
+) -> dict | None:
+    """Map an award-detail payload onto the spending_by_award row keys.
+
+    Only copies values the detail payload actually carries. Null stays null.
+    """
+    if not isinstance(detail, dict):
+        return None
+    fain = detail.get("fain")
+    fain_id = fain.strip() if isinstance(fain, str) else ""
+    api_generated = detail.get("generated_unique_award_id")
+    api_generated_id = api_generated.strip() if isinstance(api_generated, str) else ""
+    # Identity has to come from the payload. The URL we called is not enough.
+    if not fain_id and not api_generated_id:
+        return None
+    mapped_id = fain_id or award_id.strip()
+    if not mapped_id:
+        return None
+    generated = api_generated_id or fetched_id
+    recipient = _as_dict(detail.get("recipient"))
+    period = _as_dict(detail.get("period_of_performance"))
+    place = _as_dict(detail.get("place_of_performance"))
+    agency = _as_dict(_as_dict(detail.get("awarding_agency")).get("toptier_agency"))
+    return {
+        "Award ID": mapped_id,
+        "Recipient Name": recipient.get("recipient_name"),
+        "Award Amount": detail.get("total_obligation"),
+        "Total Outlays": detail.get("total_outlay"),
+        "Description": detail.get("description"),
+        "Awarding Agency": agency.get("name"),
+        "Start Date": period.get("start_date"),
+        "End Date": period.get("end_date"),
+        "Place of Performance State Code": place.get("state_code"),
+        "Award Type": detail.get("type_description"),
+        "generated_internal_id": generated,
+        "internal_id": detail.get("id"),
+        "_ingest_job": job,
+        "_ingested_at": ingested_at,
+        "_source": SOURCE_DETAIL,
+    }
+
+
+def merge_search_and_fallback(search_rows: list[dict], fallback_rows: list[dict]) -> list[dict]:
+    """Keep search rows first. A detail row whose Award ID is already present is dropped."""
+    seen = {award_id_of(row) for row in search_rows}
+    seen.discard("")
+    merged = list(search_rows)
+    for row in fallback_rows:
+        award_id = award_id_of(row)
+        if not award_id or award_id in seen:
+            continue
+        seen.add(award_id)
+        merged.append(row)
+    return merged
+
+
+def next_prior_ids(search_rows: list[dict], fallback_rows: list[dict], retry_ids: set[str]) -> set[str]:
+    """IDs to track after a successful job: today's search, recovered detail rows, and transient misses."""
+    ids = {award_id_of(row) for row in search_rows}
+    ids.discard("")
+    for row in fallback_rows:
+        award_id = award_id_of(row)
+        if award_id:
+            ids.add(award_id)
+    ids.update(award_id.strip() for award_id in retry_ids if award_id and award_id.strip())
+    return ids
+
+
+def apply_job_fallback(
+    job: str,
+    prior_ids: set[str],
+    search_rows: list[dict],
+    *,
+    fetch_detail: DetailFetcher,
+    ingested_at: str | None = None,
+) -> tuple[list[dict], set[str]]:
+    """Fetch detail rows for this job's missing IDs and return merged rows plus the next prior set."""
+    stamped = ingested_at or datetime.now(timezone.utc).isoformat()
+    missing = missing_award_ids(prior_ids, search_rows)
+    search_ids = {award_id_of(row) for row in search_rows}
+    search_ids.discard("")
+    fallback: list[dict] = []
+    retry: set[str] = set()
+    for award_id in missing:
+        candidates = detail_candidate_ids(award_id, job)
+        if not candidates:
+            continue
+        for candidate in candidates:
+            payload, outcome = fetch_detail(candidate)
+            if outcome == "gone":
+                continue
+            if outcome != "ok":
+                retry.add(award_id)
+                break
+            row = map_detail_to_row(payload or {}, job, award_id, stamped, fetched_id=candidate)
+            if row is None:
+                retry.add(award_id)
+                break
+            mapped_id = award_id_of(row)
+            if mapped_id in search_ids or any(award_id_of(existing) == mapped_id for existing in fallback):
+                break
+            fallback.append(row)
+            break
+    merged = merge_search_and_fallback(search_rows, fallback)
+    return merged, next_prior_ids(search_rows, fallback, retry)
+
+
+def detail_error_outcome(exc: BaseException) -> str:
+    """404/400/410 means the generated id is not an award. Anything else is retried next run."""
+    code = getattr(exc, "code", None)
+    if code in (400, 404, 410):
+        return "gone"
+    return "retry"
+
+
+def fetch_award_detail(generated_id: str) -> tuple[dict | None, str]:
+    """GET /api/v2/awards/<generated_unique_award_id>/. Logs status only, never a URL or secret."""
+    url = f"{DETAIL_API}{quote(generated_id, safe='')}/"
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "brik-integrity-ingest/1.0"},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            payload = json.loads(resp.read().decode())
+    except Exception as exc:
+        outcome = detail_error_outcome(exc)
+        code = getattr(exc, "code", None)
+        status = code if isinstance(code, int) else type(exc).__name__
+        print(f"detail fallback {outcome} ({status})", file=sys.stderr)
+        return None, outcome
+    if not isinstance(payload, dict):
+        print("detail fallback retry (invalid payload)", file=sys.stderr)
+        return None, "retry"
+    return payload, "ok"
+
+
+def load_prior_award_ids(path: Path | None = None) -> dict[str, set[str]]:
+    """Per-job Award IDs. A missing or unreadable file seeds an empty set."""
+    path = path or PRIOR_IDS_PATH
+    if not path.is_file():
+        print(f"prior award ids missing ({path.name}); seeding empty")
+        return {}
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"prior award ids unreadable ({type(exc).__name__}); seeding empty", file=sys.stderr)
+        return {}
+    jobs = data.get("jobs") if isinstance(data, dict) else None
+    if not isinstance(jobs, dict):
+        print("prior award ids missing jobs object; seeding empty", file=sys.stderr)
+        return {}
+    parsed: dict[str, set[str]] = {}
+    for job, raw_ids in jobs.items():
+        if not isinstance(job, str) or not isinstance(raw_ids, list):
+            continue
+        parsed[job] = {
+            str(award_id).strip()
+            for award_id in raw_ids
+            if award_id is not None and str(award_id).strip()
+        }
+    return parsed
+
+
+def save_prior_award_ids(ids_by_job: dict[str, set[str]], path: Path | None = None) -> None:
+    path = path or PRIOR_IDS_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"jobs": {job: sorted(ids) for job, ids in sorted(ids_by_job.items())}}
+    path.write_text(json.dumps(payload, indent=2) + "\n")
 
 
 # IPv4 session poolers for the us-east-1 Supabase project. Port 5432 is session
@@ -339,8 +569,11 @@ def maybe_upsert_postgres(rows: list[dict]) -> int:
 
 def main() -> int:
     OUT.mkdir(parents=True, exist_ok=True)
+    prior = load_prior_award_ids()
+    updated: dict[str, set[str]] = {job: set(ids) for job, ids in prior.items()}
     all_rows: list[dict] = []
     jobs = []
+    any_success = False
     for geo in GEOS:
         for group_name, codes in GROUPS.items():
             name = f"{geo['slug']}-{group_name}"
@@ -350,13 +583,34 @@ def main() -> int:
                 "place_of_performance_locations": geo["locations"],
                 "time_period": geo["time_period"],
             }
-            rows = fetch_all(name, filters, page_limit=geo["page_limit"])
+            search_rows, ok = fetch_all(name, filters, page_limit=geo["page_limit"])
+            rows = search_rows
+            if ok:
+                any_success = True
+                job_prior = prior.get(name, set())
+                rows, nxt = apply_job_fallback(
+                    name,
+                    job_prior,
+                    search_rows,
+                    fetch_detail=fetch_award_detail,
+                )
+                updated[name] = nxt
+                recovered = sum(1 for row in rows if row.get("_source") == SOURCE_DETAIL)
+                print(
+                    f"{name} detail_fallback missing={len(missing_award_ids(job_prior, search_rows))} "
+                    f"recovered={recovered} tracking={len(nxt)}"
+                )
+            else:
+                print(f"{name} search failed; prior award ids unchanged", file=sys.stderr)
             path = OUT / f"{name}.jsonl"
             with path.open("w") as fh:
                 for r in rows:
                     fh.write(json.dumps(r) + "\n")
-            print(f"wrote {path} ({len(rows)} rows)")
+            print(f"wrote {path.name} ({len(rows)} rows)")
             all_rows.extend(rows)
+    if any_success:
+        save_prior_award_ids(updated)
+        print(f"wrote {PRIOR_IDS_PATH.name} ({sum(len(ids) for ids in updated.values())} ids)")
     stamped = OUT / f"run-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.json"
     stamped.write_text(json.dumps({"rows": len(all_rows), "jobs": jobs}, indent=2))
     upserted = maybe_upsert_postgres(all_rows)
