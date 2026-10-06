@@ -15,6 +15,8 @@ jobs:
         run: pip install -r ingest/requirements.txt
       - name: Run ingest
         env:
+          # Direct Supabase URI is fine. Ingest derives IPv4 session-pooler
+          # URLs from this secret; do not change the secret for runners.
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: |
           python ingest/usaspending_gulf_ms.py
