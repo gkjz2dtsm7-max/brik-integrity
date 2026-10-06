@@ -3,15 +3,26 @@
 Writes JSONL under ingest/out/ and optional Postgres upsert when DATABASE_URL is set.
 One award-type group per API call (USAspending rule).
 Never invents fields — Missing stays Missing.
+
+GitHub-hosted runners are IPv4-only. db.<ref>.supabase.co is AAAA-only, so the
+upsert tries the us-east-1 session pooler (IPv4) before the original URL.
 """
 from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import quote, unquote, urlsplit, urlunsplit
+
+# Optional driver: JSONL ingest still runs when psycopg2 is not installed.
+try:
+    import psycopg2
+except ImportError:
+    psycopg2 = None
 
 OUT = Path(__file__).resolve().parent / "out"
 API = "https://api.usaspending.gov/api/v2/search/spending_by_award/"
@@ -133,84 +144,197 @@ def infer_geo(job: str) -> tuple[str | None, str | None, str | None]:
     return None, None, None
 
 
+# IPv4 session poolers for the us-east-1 Supabase project. Port 5432 is session
+# mode. Tried before the direct host, which publishes only AAAA.
+_SESSION_POOLER_HOSTS = (
+    "aws-1-us-east-1.pooler.supabase.com",
+    "aws-0-us-east-1.pooler.supabase.com",
+)
+_SESSION_POOLER_PORT = 5432
+_DIRECT_HOST = re.compile(r"^db\.([a-z0-9]{20})\.supabase\.co$")
+_POOLER_USER = re.compile(r"^postgres\.([a-z0-9]{20})$")
+_EndpointKey = tuple[str, str | None, str, int, str, str]
+
+
+def _split_userinfo(netloc: str) -> tuple[str, str | None]:
+    """Raw user and password substrings from a netloc. Password is not decoded."""
+    if "@" not in netloc:
+        return "", None
+    userinfo, _host = netloc.rsplit("@", 1)
+    if ":" not in userinfo:
+        return userinfo, None
+    user, password = userinfo.split(":", 1)
+    return user, password
+
+
+def _quote_password(raw_password: str) -> str:
+    """Encode a password for userinfo without double-encoding %XX sequences."""
+    return quote(unquote(raw_password), safe="")
+
+
+def _supabase_project_ref(database_url: str) -> str | None:
+    parts = urlsplit(database_url)
+    host_match = _DIRECT_HOST.fullmatch((parts.hostname or "").lower())
+    if host_match:
+        return host_match.group(1)
+    raw_user, _password = _split_userinfo(parts.netloc)
+    user_match = _POOLER_USER.fullmatch(unquote(raw_user))
+    if user_match:
+        return user_match.group(1)
+    return None
+
+
+def _endpoint_key(database_url: str) -> _EndpointKey:
+    parts = urlsplit(database_url)
+    raw_user, raw_password = _split_userinfo(parts.netloc)
+    password = None if raw_password is None else unquote(raw_password)
+    return (
+        unquote(raw_user),
+        password,
+        (parts.hostname or "").lower(),
+        parts.port or _SESSION_POOLER_PORT,
+        parts.path or "",
+        parts.query,
+    )
+
+
+def _session_pooler_url(database_url: str, ref: str, host: str, raw_password: str) -> str:
+    parts = urlsplit(database_url)
+    username = quote(f"postgres.{ref}", safe="")
+    netloc = f"{username}:{_quote_password(raw_password)}@{host}:{_SESSION_POOLER_PORT}"
+    path = parts.path or "/postgres"
+    scheme = parts.scheme or "postgresql"
+    return urlunsplit((scheme, netloc, path, parts.query, ""))
+
+
+def postgres_candidate_urls(database_url: str) -> list[str]:
+    """Session-pooler URLs first, then the original DATABASE_URL.
+
+    Does not print the URL or the password. Non-Supabase URLs are returned unchanged.
+    """
+    original = database_url.strip()
+    if not original:
+        return []
+    parts = urlsplit(original)
+    ref = _supabase_project_ref(original)
+    _raw_user, raw_password = _split_userinfo(parts.netloc)
+    if ref is None or raw_password is None:
+        return [original]
+
+    candidates: list[str] = []
+    seen: set[_EndpointKey] = set()
+    for host in _SESSION_POOLER_HOSTS:
+        candidate = _session_pooler_url(original, ref, host, raw_password)
+        key = _endpoint_key(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        candidates.append(candidate)
+    if _endpoint_key(original) not in seen:
+        candidates.append(original)
+    return candidates
+
+
+def _log_pg_failure(exc: BaseException, *, final: bool) -> None:
+    """Log exception type and pgcode only. Never the DSN, URL, or password."""
+    pgcode = getattr(exc, "pgcode", None) or "none"
+    detail = f"Postgres upsert failed ({type(exc).__name__}, pgcode={pgcode})"
+    if final:
+        print(f"{detail} — JSONL only", file=sys.stderr)
+        return
+    print(f"{detail}; trying next candidate", file=sys.stderr)
+
+
+def _upsert_rows(conn, rows: list[dict]) -> int:
+    with conn.cursor() as cur:
+        # ensure seed places exist
+        cur.execute(
+            """
+            INSERT INTO places (fips_code, name, state, county, type) VALUES
+              ('12045', 'Gulf County', 'FL', 'Gulf', 'county'),
+              ('28', 'Mississippi', 'MS', NULL, 'state')
+            ON CONFLICT (fips_code) DO NOTHING
+            """
+        )
+        place_ids: dict[str, str] = {}
+        cur.execute("SELECT fips_code, id FROM places WHERE fips_code IN ('12045','28')")
+        for fips, pid in cur.fetchall():
+            place_ids[str(fips)] = str(pid)
+
+        n = 0
+        for r in rows:
+            source_id = str(r.get("Award ID") or r.get("generated_internal_id") or "")
+            if not source_id:
+                continue
+            job = str(r.get("_ingest_job") or "")
+            state, county, fips = infer_geo(job)
+            place_id = place_ids.get(fips or "")
+            amount = r.get("Award Amount")
+            if amount is None and job.endswith("-loans"):
+                amount = r.get("Face Value of Loan")
+            cur.execute(
+                """
+                INSERT INTO awards (
+                  usaspending_id, award_type, title, description, agency_name,
+                  amount, start_date, end_date, recipient_name, place_id,
+                  fips_code, state, county, url, last_updated
+                ) VALUES (
+                  %s, %s, %s, %s, %s,
+                  %s, %s, %s, %s, %s,
+                  %s, %s, %s, %s, now()
+                )
+                ON CONFLICT (usaspending_id) DO UPDATE SET
+                  amount = EXCLUDED.amount,
+                  description = EXCLUDED.description,
+                  agency_name = EXCLUDED.agency_name,
+                  last_updated = now()
+                """,
+                (
+                    source_id,
+                    infer_award_type(job, r),
+                    (r.get("Description") or "")[:500] or None,
+                    r.get("Description"),
+                    r.get("Awarding Agency"),
+                    amount,
+                    r.get("Start Date") or None,
+                    r.get("End Date") or None,
+                    r.get("Recipient Name"),
+                    place_id,
+                    fips,
+                    state or r.get("Place of Performance State Code"),
+                    county,
+                    f"https://www.usaspending.gov/award/{source_id}" if source_id else None,
+                ),
+            )
+            n += 1
+        return n
+
+
 def maybe_upsert_postgres(rows: list[dict]) -> int:
     url = os.environ.get("DATABASE_URL")
     if not url:
         print("DATABASE_URL unset — wrote JSONL only")
         return 0
-    try:
-        import psycopg2
-    except ImportError:
+    if psycopg2 is None:
         print("psycopg2 not installed — JSONL only", file=sys.stderr)
         return 0
     try:
-        with psycopg2.connect(url) as conn:
-            with conn.cursor() as cur:
-                # ensure seed places exist
-                cur.execute(
-                    """
-                    INSERT INTO places (fips_code, name, state, county, type) VALUES
-                      ('12045', 'Gulf County', 'FL', 'Gulf', 'county'),
-                      ('28', 'Mississippi', 'MS', NULL, 'state')
-                    ON CONFLICT (fips_code) DO NOTHING
-                    """
-                )
-                place_ids: dict[str, str] = {}
-                cur.execute("SELECT fips_code, id FROM places WHERE fips_code IN ('12045','28')")
-                for fips, pid in cur.fetchall():
-                    place_ids[str(fips)] = str(pid)
-
-                n = 0
-                for r in rows:
-                    source_id = str(r.get("Award ID") or r.get("generated_internal_id") or "")
-                    if not source_id:
-                        continue
-                    job = str(r.get("_ingest_job") or "")
-                    state, county, fips = infer_geo(job)
-                    place_id = place_ids.get(fips or "")
-                    amount = r.get("Award Amount")
-                    if amount is None and job.endswith("-loans"):
-                        amount = r.get("Face Value of Loan")
-                    cur.execute(
-                        """
-                        INSERT INTO awards (
-                          usaspending_id, award_type, title, description, agency_name,
-                          amount, start_date, end_date, recipient_name, place_id,
-                          fips_code, state, county, url, last_updated
-                        ) VALUES (
-                          %s, %s, %s, %s, %s,
-                          %s, %s, %s, %s, %s,
-                          %s, %s, %s, %s, now()
-                        )
-                        ON CONFLICT (usaspending_id) DO UPDATE SET
-                          amount = EXCLUDED.amount,
-                          description = EXCLUDED.description,
-                          agency_name = EXCLUDED.agency_name,
-                          last_updated = now()
-                        """,
-                        (
-                            source_id,
-                            infer_award_type(job, r),
-                            (r.get("Description") or "")[:500] or None,
-                            r.get("Description"),
-                            r.get("Awarding Agency"),
-                            amount,
-                            r.get("Start Date") or None,
-                            r.get("End Date") or None,
-                            r.get("Recipient Name"),
-                            place_id,
-                            fips,
-                            state or r.get("Place of Performance State Code"),
-                            county,
-                            f"https://www.usaspending.gov/award/{source_id}" if source_id else None,
-                        ),
-                    )
-                    n += 1
-                return n
-    except psycopg2.Error as e:
-        pgcode = getattr(e, "pgcode", None) or "none"
-        print(f"Postgres upsert failed ({type(e).__name__}, pgcode={pgcode}) — JSONL only", file=sys.stderr)
-        return 0
+        candidates = postgres_candidate_urls(url)
+    except Exception as exc:
+        print(
+            f"Postgres URL derivation failed ({type(exc).__name__}); using DATABASE_URL",
+            file=sys.stderr,
+        )
+        candidates = [url]
+    if not candidates:
+        candidates = [url]
+    for index, candidate in enumerate(candidates):
+        try:
+            with psycopg2.connect(candidate) as conn:
+                return _upsert_rows(conn, rows)
+        except psycopg2.Error as exc:
+            _log_pg_failure(exc, final=index == len(candidates) - 1)
+    return 0
 
 
 def main() -> int:
