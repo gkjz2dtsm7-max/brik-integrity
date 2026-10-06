@@ -1,3 +1,4 @@
-ingest/out/
+ingest/out/*
+!ingest/out/prior_award_ids.json
 .env
 **/__pycache__/

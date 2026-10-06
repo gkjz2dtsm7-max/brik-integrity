@@ -22,7 +22,7 @@ export DATABASE_URL='postgresql://...'
 python3 ingest/usaspending_gulf_ms.py
 ```
 
-Pulls Gulf County FL + Mississippi awards by award-type group (contracts, grants, loans, direct_payments, other). Writes JSONL under `ingest/out/` (gitignored) and upserts into `awards` when `DATABASE_URL` is set.
+Pulls Gulf County FL + Mississippi awards by award-type group (contracts, grants, loans, direct_payments, other). Writes JSONL under `ingest/out/` (gitignored, not published to Pages) and upserts into `awards` when `DATABASE_URL` is set. Award IDs from successful pulls are kept in `ingest/out/prior_award_ids.json` (committed) so a later search miss can be filled from the award detail API. See `ingest/README.md`.
 
 ## Rules
 - Never invent awards, dockets, or bank account numbers.
